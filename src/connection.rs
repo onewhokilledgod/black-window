@@ -91,6 +91,9 @@ pub fn run(stream: TcpStream, peer_name: &'static str) -> io::Result<()> {
 						);
 						break;
 					}
+				} else if message.len() > crate::protocol::MAX_MESSAGE_SIZE {
+					eprintln!("Сообщение слишком длинное");
+					continue;
 				} else if let Err(error) = send_text(&mut writer, &message) {
 					eprintln!(
 						"Ошибка отправки сообщения; соединение будет закрыто: {error}"
