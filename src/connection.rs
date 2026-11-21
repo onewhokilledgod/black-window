@@ -4,30 +4,34 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::protocol::{
-	prepare_file, receive_messages, send_close, send_file, send_text,
+	MAX_MESSAGE_SIZE, prepare_file, receive_messages, send_close, send_file,
+	send_text,
 };
 
 enum Event {
 	Input(String),
 	InputClosed,
-	InputError(String),
-	NetworkClosed(Result<(), String>),
+	InputError(io::Error),
+	NetworkClosed(io::Result<()>),
 }
 
 pub fn run(stream: TcpStream, peer_name: &'static str) -> io::Result<()> {
 	let reader_stream = stream.try_clone()?;
+
 	let (event_sender, event_receiver) = mpsc::channel();
 
 	// Поток получения данных из TCP-соединения.
 	let network_sender = event_sender.clone();
+
 	let receive_handle = thread::spawn(move || {
-		let result = receive_messages(reader_stream, peer_name)
-			.map_err(|error| error.to_string());
+		let result = receive_messages(reader_stream, peer_name);
+
 		let _ = network_sender.send(Event::NetworkClosed(result));
 	});
 
-	// Отдельный поток читает stdin, чтобы основной поток мог заметить отключение собеседника.
+	// Отдельный поток читает stdin.
 	let input_sender = event_sender.clone();
+
 	thread::spawn(move || {
 		let stdin = io::stdin();
 
@@ -38,8 +42,9 @@ pub fn run(stream: TcpStream, peer_name: &'static str) -> io::Result<()> {
 						return;
 					}
 				}
+
 				Err(error) => {
-					let _ = input_sender.send(Event::InputError(error.to_string()));
+					let _ = input_sender.send(Event::InputError(error));
 					return;
 				}
 			}
@@ -52,6 +57,10 @@ pub fn run(stream: TcpStream, peer_name: &'static str) -> io::Result<()> {
 
 	let mut writer = stream;
 
+	// Здесь сохраняем критическую ошибку, чтобы вернуть её
+	// вызывающему коду после завершения соединения.
+	let mut connection_error: Option<io::Error> = None;
+
 	println!();
 	println!("Чат запущен!");
 	println!("Отправка файла: /file путь_к_файлу");
@@ -63,7 +72,10 @@ pub fn run(stream: TcpStream, peer_name: &'static str) -> io::Result<()> {
 				if message == "/quit" {
 					if let Err(error) = send_close(&mut writer) {
 						eprintln!("Не удалось отправить пакет завершения: {error}");
+
+						connection_error = Some(error);
 					}
+
 					break;
 				}
 
@@ -72,61 +84,104 @@ pub fn run(stream: TcpStream, peer_name: &'static str) -> io::Result<()> {
 
 					if path.is_empty() {
 						println!("Укажи путь к файлу: /file путь_к_файлу");
+
 						continue;
 					}
 
-					// Локальные ошибки (например, файл не найден) не затрагивают соединение.
+					// Локальные ошибки не затрагивают соединение.
 					let prepared_file = match prepare_file(path) {
 						Ok(file) => file,
+
 						Err(error) => {
 							eprintln!("Невозможно подготовить файл: {error}");
+
 							continue;
 						}
 					};
 
-					// Ошибка после начала записи пакета может нарушить границы протокола.
+					// Ошибка передачи может нарушить границы протокола.
 					if let Err(error) = send_file(&mut writer, prepared_file) {
 						eprintln!(
 							"Ошибка передачи файла; соединение будет закрыто: {error}"
 						);
+
+						connection_error = Some(error);
 						break;
 					}
-				} else if message.len() > crate::protocol::MAX_MESSAGE_SIZE {
-					eprintln!("Сообщение слишком длинное");
+				} else if message.len() > MAX_MESSAGE_SIZE {
+					// Ошибка пользовательского ввода:
+					// соединение остаётся открытым.
+					eprintln!(
+						"Сообщение слишком длинное. Максимум: {MAX_MESSAGE_SIZE} байт"
+					);
+
 					continue;
 				} else if let Err(error) = send_text(&mut writer, &message) {
 					eprintln!(
 						"Ошибка отправки сообщения; соединение будет закрыто: {error}"
 					);
+
+					connection_error = Some(error);
 					break;
 				}
 			}
+
 			Ok(Event::InputClosed) => {
-				let _ = send_close(&mut writer);
+				if let Err(error) = send_close(&mut writer) {
+					eprintln!("Не удалось отправить пакет завершения: {error}");
+
+					connection_error = Some(error);
+				}
+
 				break;
 			}
+
 			Ok(Event::InputError(error)) => {
 				eprintln!("Ошибка чтения ввода: {error}");
-				let _ = send_close(&mut writer);
+
+				if let Err(close_error) = send_close(&mut writer) {
+					eprintln!("Не удалось отправить пакет завершения: {close_error}");
+				}
+
+				connection_error = Some(error);
 				break;
 			}
-			Ok(Event::NetworkClosed(Ok(()))) => break,
+
+			Ok(Event::NetworkClosed(Ok(()))) => {
+				break;
+			}
+
 			Ok(Event::NetworkClosed(Err(error))) => {
 				eprintln!("Ошибка получения данных: {error}");
+
+				connection_error = Some(error);
 				break;
 			}
-			Err(_) => break,
+
+			Err(_) => {
+				break;
+			}
 		}
 	}
 
-	// Разблокируем поток чтения и завершаем TCP-соединение в обе стороны.
+	// Разблокируем поток чтения и завершаем TCP-соединение.
 	let _ = writer.shutdown(Shutdown::Both);
 
 	if receive_handle.join().is_err() {
 		eprintln!("Поток получения данных завершился с паникой");
+
+		if connection_error.is_none() {
+			connection_error = Some(io::Error::new(
+				io::ErrorKind::Other,
+				"Поток получения данных завершился с паникой",
+			));
+		}
 	}
 
 	println!("Соединение закрыто");
 
-	Ok(())
+	match connection_error {
+		Some(error) => Err(error),
+		None => Ok(()),
+	}
 }

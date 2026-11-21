@@ -1,6 +1,5 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 
 pub const PACKET_TEXT: u8 = 0;
@@ -14,14 +13,16 @@ pub const MAX_FILE_NAME_SIZE: usize = 255; // байт в UTF-8
 const DOWNLOAD_DIRECTORY: &str = "downloads";
 
 /// Подготовленный к отправке файл.
-/// Файл открывается и проверяется до того, как в TCP-поток попадёт заголовок.
+/// Все локальные проверки выполняются до начала передачи.
 pub struct PreparedFile {
 	file: File,
 	file_name: String,
 	file_size: u64,
 }
 
-pub fn send_text(writer: &mut TcpStream, message: &str) -> io::Result<()> {
+/// Отправляет текстовый пакет:
+/// [тип: u8][длина: u32][содержимое].
+pub fn send_text<W: Write>(writer: &mut W, message: &str) -> io::Result<()> {
 	let bytes = message.as_bytes();
 
 	if bytes.len() > MAX_MESSAGE_SIZE {
@@ -45,7 +46,7 @@ pub fn send_text(writer: &mut TcpStream, message: &str) -> io::Result<()> {
 	Ok(())
 }
 
-/// Открывает файл и выполняет все локальные проверки до начала передачи.
+/// Открывает файл и выполняет локальные проверки до передачи.
 pub fn prepare_file(path: &str) -> io::Result<PreparedFile> {
 	let file = File::open(path)?;
 	let metadata = file.metadata()?;
@@ -83,10 +84,10 @@ pub fn prepare_file(path: &str) -> io::Result<PreparedFile> {
 	})
 }
 
-/// Передаёт подготовленный файл в формате:
-/// [тип: 1][длина имени: u16][имя][размер: u64][содержимое].
-pub fn send_file(
-	writer: &mut TcpStream,
+/// Отправляет файловый пакет:
+/// [тип: u8][длина имени: u16][имя][размер: u64][содержимое].
+pub fn send_file<W: Write>(
+	writer: &mut W,
 	prepared: PreparedFile,
 ) -> io::Result<()> {
 	let PreparedFile {
@@ -96,6 +97,7 @@ pub fn send_file(
 	} = prepared;
 
 	let name_bytes = file_name.as_bytes();
+
 	let name_length = u16::try_from(name_bytes.len()).map_err(|_| {
 		io::Error::new(io::ErrorKind::InvalidInput, "Имя файла слишком длинное")
 	})?;
@@ -105,8 +107,9 @@ pub fn send_file(
 	writer.write_all(name_bytes)?;
 	writer.write_all(&file_size.to_be_bytes())?;
 
-	// Отправляем строго file_size байтов, даже если исходный файл увеличится.
+	// Передаём строго file_size байтов.
 	let mut limited_file = file.take(file_size);
+
 	let sent = io::copy(&mut limited_file, writer)?;
 
 	if sent != file_size {
@@ -121,45 +124,53 @@ pub fn send_file(
 	Ok(())
 }
 
-pub fn send_close(writer: &mut TcpStream) -> io::Result<()> {
+/// Отправляет пакет завершения:
+/// [тип: u8].
+pub fn send_close<W: Write>(writer: &mut W) -> io::Result<()> {
 	writer.write_all(&[PACKET_CLOSE])
 }
 
-/// Читает входящие пакеты до отключения собеседника или получения PACKET_CLOSE.
-pub fn receive_messages(stream: TcpStream, peer_name: &str) -> io::Result<()> {
-	let mut reader = io::BufReader::new(stream);
+/// Читает входящие пакеты до отключения собеседника
+/// или получения PACKET_CLOSE.
+pub fn receive_messages<R: Read>(input: R, peer_name: &str) -> io::Result<()> {
+	let mut reader = io::BufReader::new(input);
 
 	loop {
 		let mut packet_type = [0u8; 1];
 
 		match reader.read_exact(&mut packet_type) {
 			Ok(()) => {}
+
 			Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
 				println!("{peer_name} отключился");
 				return Ok(());
 			}
+
 			Err(error) => return Err(error),
 		}
 
 		match packet_type[0] {
-			PACKET_TEXT => receive_text(&mut reader)?,
-			PACKET_FILE => receive_file(&mut reader)?,
+			PACKET_TEXT => receive_text(&mut reader),
+			PACKET_FILE => receive_file(&mut reader),
+
 			PACKET_CLOSE => {
 				println!("{peer_name} завершил соединение");
 				return Ok(());
 			}
+
 			_ => {
 				return Err(io::Error::new(
 					io::ErrorKind::InvalidData,
 					"Получен неизвестный тип пакета",
 				));
 			}
-		}
+		}?;
 	}
 }
 
 fn receive_text<R: Read>(reader: &mut R) -> io::Result<()> {
 	let mut length_bytes = [0u8; 4];
+
 	reader.read_exact(&mut length_bytes)?;
 
 	let length = u32::from_be_bytes(length_bytes) as usize;
@@ -172,6 +183,7 @@ fn receive_text<R: Read>(reader: &mut R) -> io::Result<()> {
 	}
 
 	let mut message_bytes = vec![0u8; length];
+
 	reader.read_exact(&mut message_bytes)?;
 
 	let message = String::from_utf8(message_bytes).map_err(|_| {
@@ -188,6 +200,7 @@ fn receive_text<R: Read>(reader: &mut R) -> io::Result<()> {
 
 fn receive_file<R: Read>(reader: &mut R) -> io::Result<()> {
 	let mut name_length_bytes = [0u8; 2];
+
 	reader.read_exact(&mut name_length_bytes)?;
 
 	let name_length = u16::from_be_bytes(name_length_bytes) as usize;
@@ -200,6 +213,7 @@ fn receive_file<R: Read>(reader: &mut R) -> io::Result<()> {
 	}
 
 	let mut name_bytes = vec![0u8; name_length];
+
 	reader.read_exact(&mut name_bytes)?;
 
 	let file_name = String::from_utf8(name_bytes).map_err(|_| {
@@ -217,6 +231,7 @@ fn receive_file<R: Read>(reader: &mut R) -> io::Result<()> {
 	})?;
 
 	let mut size_bytes = [0u8; 8];
+
 	reader.read_exact(&mut size_bytes)?;
 
 	let file_size = u64::from_be_bytes(size_bytes);
@@ -230,20 +245,23 @@ fn receive_file<R: Read>(reader: &mut R) -> io::Result<()> {
 
 	fs::create_dir_all(DOWNLOAD_DIRECTORY)?;
 
-	// Не перезаписываем существующие файлы: подбираем свободное имя.
+	// Создаём файл, не перезаписывая существующий.
 	let (mut file, destination) = create_unique_file(&file_name)?;
 
-	// Читаем из TCP-потока ровно file_size байтов.
+	// Читаем ровно file_size байтов из потока.
 	let copy_result = {
 		let mut limited_reader = (&mut *reader).take(file_size);
+
 		io::copy(&mut limited_reader, &mut file)
 	};
 
 	let received = match copy_result {
 		Ok(received) => received,
+
 		Err(error) => {
 			drop(file);
 			let _ = fs::remove_file(&destination);
+
 			return Err(error);
 		}
 	};
@@ -252,6 +270,7 @@ fn receive_file<R: Read>(reader: &mut R) -> io::Result<()> {
 
 	if received != file_size {
 		let _ = fs::remove_file(&destination);
+
 		return Err(io::Error::new(
 			io::ErrorKind::UnexpectedEof,
 			"Файл получен не полностью",
@@ -290,10 +309,12 @@ fn validate_file_name(name: &str) -> io::Result<()> {
 
 fn create_unique_file(file_name: &str) -> io::Result<(File, PathBuf)> {
 	let original_path = Path::new(file_name);
+
 	let stem = original_path
 		.file_stem()
 		.and_then(|value| value.to_str())
 		.unwrap_or(file_name);
+
 	let extension = original_path.extension().and_then(|value| value.to_str());
 
 	for index in 0..10_000u32 {
@@ -313,7 +334,11 @@ fn create_unique_file(file_name: &str) -> io::Result<(File, PathBuf)> {
 			.open(&destination)
 		{
 			Ok(file) => return Ok((file, destination)),
-			Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+
+			Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+				continue;
+			}
+
 			Err(error) => return Err(error),
 		}
 	}
@@ -322,4 +347,67 @@ fn create_unique_file(file_name: &str) -> io::Result<(File, PathBuf)> {
 		io::ErrorKind::AlreadyExists,
 		"Не удалось подобрать свободное имя для файла",
 	))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::io::Cursor;
+
+	#[test]
+	fn send_text_writes_correct_packet() {
+		let mut output = Vec::new();
+		let message = "Привет";
+
+		send_text(&mut output, message).unwrap();
+
+		let bytes = message.as_bytes();
+
+		assert_eq!(output[0], PACKET_TEXT);
+
+		assert_eq!(&output[1..5], &(bytes.len() as u32).to_be_bytes()[..]);
+
+		assert_eq!(&output[5..], bytes);
+	}
+
+	#[test]
+	fn send_text_rejects_oversized_message() {
+		let mut output = Vec::new();
+		let message = "A".repeat(MAX_MESSAGE_SIZE + 1);
+
+		let error = send_text(&mut output, &message).unwrap_err();
+
+		assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+		assert!(output.is_empty());
+	}
+
+	#[test]
+	fn receive_messages_stops_on_close_packet() {
+		let input = Cursor::new(vec![PACKET_CLOSE]);
+
+		assert!(receive_messages(input, "Тест").is_ok());
+	}
+
+	#[test]
+	fn receive_messages_rejects_unknown_packet() {
+		let input = Cursor::new(vec![255]);
+
+		let error = receive_messages(input, "Тест").unwrap_err();
+
+		assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+	}
+
+	#[test]
+	fn receive_messages_rejects_truncated_text() {
+		let mut packet = vec![PACKET_TEXT];
+
+		packet.extend_from_slice(&3u32.to_be_bytes());
+		packet.push(b'A');
+
+		let input = Cursor::new(packet);
+
+		let error = receive_messages(input, "Тест").unwrap_err();
+
+		assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+	}
 }
