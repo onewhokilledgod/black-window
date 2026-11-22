@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 pub const PACKET_TEXT: u8 = 0;
 pub const PACKET_FILE: u8 = 1;
@@ -18,6 +19,107 @@ pub struct PreparedFile {
 	file: File,
 	file_name: String,
 	file_size: u64,
+}
+
+/// Копирует данные порциями и показывает ход передачи в терминале.
+/// Сетевой протокол не меняется: функция лишь заменяет io::copy.
+fn copy_with_progress<R: Read, W: Write>(
+	reader: &mut R,
+	writer: &mut W,
+	total_size: u64,
+	operation: &str,
+) -> io::Result<u64> {
+	const BUFFER_SIZE: usize = 64 * 1024;
+
+	let started_at = Instant::now();
+	let mut buffer = [0u8; BUFFER_SIZE];
+	let mut copied = 0u64;
+	let mut last_percent = if total_size == 0 { 100 } else { 0 };
+
+	// Сразу показываем начало передачи. Для пустого файла прогресс равен 100%.
+	print_transfer_progress(operation, 0, total_size, started_at);
+
+	loop {
+		let bytes_read = match reader.read(&mut buffer) {
+			Ok(0) => break,
+			Ok(bytes_read) => bytes_read,
+			Err(error) => {
+				println!();
+				return Err(error);
+			}
+		};
+
+		if let Err(error) = writer.write_all(&buffer[..bytes_read]) {
+			println!();
+			return Err(error);
+		}
+
+		copied += bytes_read as u64;
+		let percent = if total_size == 0 {
+			100
+		} else {
+			(copied.saturating_mul(100) / total_size).min(100) as u8
+		};
+
+		if last_percent != percent {
+			print_transfer_progress(operation, copied, total_size, started_at);
+			last_percent = percent;
+		}
+	}
+
+	println!();
+	Ok(copied)
+}
+
+/// Обновляет одну строку прогресса, не засоряя терминал новыми строками.
+fn print_transfer_progress(
+	operation: &str,
+	copied: u64,
+	total_size: u64,
+	started_at: Instant,
+) {
+	const BAR_WIDTH: usize = 24;
+
+	let percent = if total_size == 0 {
+		100
+	} else {
+		(copied.saturating_mul(100) / total_size).min(100) as usize
+	};
+	let filled = BAR_WIDTH * percent / 100;
+	let bar = format!("{}{}", "#".repeat(filled), "-".repeat(BAR_WIDTH - filled));
+
+	let elapsed_seconds = started_at.elapsed().as_secs_f64().max(0.001);
+	let bytes_per_second = (copied as f64 / elapsed_seconds) as u64;
+
+	let stdout = io::stdout();
+	let mut output = stdout.lock();
+	let _ = write!(
+		output,
+		"\r\x1B[2K{operation}: [{bar}] {percent:3}% | {} / {} | {}/s",
+		format_bytes(copied),
+		format_bytes(total_size),
+		format_bytes(bytes_per_second),
+	);
+	let _ = output.flush();
+}
+
+/// Форматирует количество байтов в удобный для чтения вид.
+fn format_bytes(bytes: u64) -> String {
+	const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
+
+	let mut value = bytes as f64;
+	let mut unit_index = 0;
+
+	while value >= 1024.0 && unit_index < UNITS.len() - 1 {
+		value /= 1024.0;
+		unit_index += 1;
+	}
+
+	if unit_index == 0 {
+		format!("{bytes} {}", UNITS[unit_index])
+	} else {
+		format!("{value:.1} {}", UNITS[unit_index])
+	}
 }
 
 /// Отправляет текстовый пакет:
@@ -110,7 +212,8 @@ pub fn send_file<W: Write>(
 	// Передаём строго file_size байтов.
 	let mut limited_file = file.take(file_size);
 
-	let sent = io::copy(&mut limited_file, writer)?;
+	let sent =
+		copy_with_progress(&mut limited_file, writer, file_size, "Отправка")?;
 
 	if sent != file_size {
 		return Err(io::Error::new(
@@ -252,7 +355,7 @@ fn receive_file<R: Read>(reader: &mut R) -> io::Result<()> {
 	let copy_result = {
 		let mut limited_reader = (&mut *reader).take(file_size);
 
-		io::copy(&mut limited_reader, &mut file)
+		copy_with_progress(&mut limited_reader, &mut file, file_size, "Получение")
 	};
 
 	let received = match copy_result {
@@ -353,6 +456,36 @@ fn create_unique_file(file_name: &str) -> io::Result<(File, PathBuf)> {
 mod tests {
 	use super::*;
 	use std::io::Cursor;
+
+	#[test]
+	fn copy_with_progress_copies_data() {
+		let input_bytes = vec![b'A'; 150 * 1024];
+		let mut input = Cursor::new(input_bytes.clone());
+		let mut output = Vec::new();
+
+		let copied = copy_with_progress(
+			&mut input,
+			&mut output,
+			input_bytes.len() as u64,
+			"Тест",
+		)
+		.unwrap();
+
+		assert_eq!(copied, input_bytes.len() as u64);
+		assert_eq!(output, input_bytes);
+	}
+
+	#[test]
+	fn copy_with_progress_handles_empty_input() {
+		let mut input = Cursor::new(Vec::<u8>::new());
+		let mut output = Vec::new();
+
+		let copied =
+			copy_with_progress(&mut input, &mut output, 0, "Тест").unwrap();
+
+		assert_eq!(copied, 0);
+		assert!(output.is_empty());
+	}
 
 	#[test]
 	fn send_text_writes_correct_packet() {
