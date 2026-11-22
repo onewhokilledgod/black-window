@@ -249,6 +249,12 @@ fn render_transfer_dashboard(
 	state: TransferState,
 	repaint: bool,
 ) {
+	// Не рисуем интерактивный интерфейс во время unit-тестов: несколько тестов
+	// могут выполняться параллельно и перезаписывать одну область терминала.
+	if cfg!(test) {
+		return;
+	}
+
 	let stdout = io::stdout();
 	let is_terminal = stdout.is_terminal();
 	let use_color = is_terminal
