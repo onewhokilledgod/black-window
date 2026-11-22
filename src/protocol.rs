@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -21,13 +21,42 @@ pub struct PreparedFile {
 	file_size: u64,
 }
 
-/// Копирует данные порциями и показывает ход передачи в терминале.
+/// Состояние передачи, отображаемое в терминальной панели.
+#[derive(Clone, Copy)]
+enum TransferState {
+	Running,
+	Completed,
+	Incomplete,
+	Failed,
+}
+
+impl TransferState {
+	fn label(self) -> &'static str {
+		match self {
+			Self::Running => "В ПРОЦЕССЕ",
+			Self::Completed => "ЗАВЕРШЕНО",
+			Self::Incomplete => "НЕПОЛНО",
+			Self::Failed => "ОШИБКА",
+		}
+	}
+
+	fn color(self) -> &'static str {
+		match self {
+			Self::Running => "36",                   // cyan
+			Self::Completed => "32",                 // green
+			Self::Incomplete | Self::Failed => "31", // red
+		}
+	}
+}
+
+/// Копирует данные порциями и показывает адаптивную панель передачи.
 /// Сетевой протокол не меняется: функция лишь заменяет io::copy.
 fn copy_with_progress<R: Read, W: Write>(
 	reader: &mut R,
 	writer: &mut W,
 	total_size: u64,
 	operation: &str,
+	file_name: &str,
 ) -> io::Result<u64> {
 	const BUFFER_SIZE: usize = 64 * 1024;
 
@@ -36,21 +65,44 @@ fn copy_with_progress<R: Read, W: Write>(
 	let mut copied = 0u64;
 	let mut last_percent = if total_size == 0 { 100 } else { 0 };
 
-	// Сразу показываем начало передачи. Для пустого файла прогресс равен 100%.
-	print_transfer_progress(operation, 0, total_size, started_at);
+	render_transfer_dashboard(
+		operation,
+		file_name,
+		copied,
+		total_size,
+		started_at,
+		TransferState::Running,
+		false,
+	);
 
 	loop {
 		let bytes_read = match reader.read(&mut buffer) {
 			Ok(0) => break,
 			Ok(bytes_read) => bytes_read,
 			Err(error) => {
-				println!();
+				render_transfer_dashboard(
+					operation,
+					file_name,
+					copied,
+					total_size,
+					started_at,
+					TransferState::Failed,
+					true,
+				);
 				return Err(error);
 			}
 		};
 
 		if let Err(error) = writer.write_all(&buffer[..bytes_read]) {
-			println!();
+			render_transfer_dashboard(
+				operation,
+				file_name,
+				copied,
+				total_size,
+				started_at,
+				TransferState::Failed,
+				true,
+			);
 			return Err(error);
 		}
 
@@ -62,45 +114,361 @@ fn copy_with_progress<R: Read, W: Write>(
 		};
 
 		if last_percent != percent {
-			print_transfer_progress(operation, copied, total_size, started_at);
+			render_transfer_dashboard(
+				operation,
+				file_name,
+				copied,
+				total_size,
+				started_at,
+				TransferState::Running,
+				true,
+			);
 			last_percent = percent;
 		}
 	}
 
-	println!();
+	let final_state = if copied == total_size {
+		TransferState::Completed
+	} else {
+		TransferState::Incomplete
+	};
+
+	render_transfer_dashboard(
+		operation,
+		file_name,
+		copied,
+		total_size,
+		started_at,
+		final_state,
+		true,
+	);
+
 	Ok(copied)
 }
 
-/// Обновляет одну строку прогресса, не засоряя терминал новыми строками.
-fn print_transfer_progress(
+const DASHBOARD_LINES: usize = 9;
+
+/// Возвращает актуальную ширину терминала. На Unix используем ioctl, чтобы
+/// учитывать изменение размера окна во время передачи; COLUMNS служит fallback.
+fn terminal_width() -> usize {
+	#[cfg(all(
+		unix,
+		any(
+			target_os = "linux",
+			target_os = "android",
+			target_os = "macos",
+			target_os = "ios",
+			target_os = "freebsd",
+			target_os = "openbsd",
+			target_os = "netbsd",
+			target_os = "dragonfly"
+		)
+	))]
+	if let Some(width) = terminal_width_from_ioctl() {
+		return width;
+	}
+
+	std::env::var("COLUMNS")
+		.ok()
+		.and_then(|value| value.parse::<usize>().ok())
+		.filter(|&width| width > 0)
+		.unwrap_or(80)
+}
+
+#[cfg(all(
+	unix,
+	any(
+		target_os = "linux",
+		target_os = "android",
+		target_os = "macos",
+		target_os = "ios",
+		target_os = "freebsd",
+		target_os = "openbsd",
+		target_os = "netbsd",
+		target_os = "dragonfly"
+	)
+))]
+fn terminal_width_from_ioctl() -> Option<usize> {
+	use std::os::fd::AsRawFd;
+
+	#[repr(C)]
+	struct WindowSize {
+		rows: u16,
+		columns: u16,
+		x_pixels: u16,
+		y_pixels: u16,
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "android"))]
+	const TIOCGWINSZ: std::ffi::c_ulong = 0x5413;
+	#[cfg(any(
+		target_os = "macos",
+		target_os = "ios",
+		target_os = "freebsd",
+		target_os = "openbsd",
+		target_os = "netbsd",
+		target_os = "dragonfly"
+	))]
+	const TIOCGWINSZ: std::ffi::c_ulong = 0x4008_7468;
+
+	unsafe extern "C" {
+		fn ioctl(
+			fd: std::ffi::c_int,
+			request: std::ffi::c_ulong,
+			...
+		) -> std::ffi::c_int;
+	}
+
+	let stdout = io::stdout();
+	let mut size = WindowSize {
+		rows: 0,
+		columns: 0,
+		x_pixels: 0,
+		y_pixels: 0,
+	};
+
+	let result = unsafe {
+		ioctl(stdout.as_raw_fd(), TIOCGWINSZ, &mut size as *mut WindowSize)
+	};
+
+	if result == 0 && size.columns > 0 {
+		Some(size.columns as usize)
+	} else {
+		None
+	}
+}
+
+/// Отрисовывает dashboard. Ширина считывается у терминала при каждом обновлении,
+/// поэтому панель подстраивается и при изменении размера окна.
+fn render_transfer_dashboard(
 	operation: &str,
+	file_name: &str,
 	copied: u64,
 	total_size: u64,
 	started_at: Instant,
+	state: TransferState,
+	repaint: bool,
 ) {
-	const BAR_WIDTH: usize = 24;
+	let stdout = io::stdout();
+	let is_terminal = stdout.is_terminal();
+	let use_color = is_terminal
+		&& std::env::var_os("NO_COLOR").is_none()
+		&& std::env::var("TERM").map_or(true, |term| term != "dumb");
+	let mut output = stdout.lock();
 
+	let elapsed = started_at.elapsed();
+	let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
+	let bytes_per_second = copied as f64 / elapsed_seconds;
 	let percent = if total_size == 0 {
 		100
 	} else {
 		(copied.saturating_mul(100) / total_size).min(100) as usize
 	};
-	let filled = BAR_WIDTH * percent / 100;
-	let bar = format!("{}{}", "#".repeat(filled), "-".repeat(BAR_WIDTH - filled));
 
-	let elapsed_seconds = started_at.elapsed().as_secs_f64().max(0.001);
-	let bytes_per_second = (copied as f64 / elapsed_seconds) as u64;
+	// При перенаправлении вывода не отправляем ANSI-последовательности в файл/pipe.
+	if !is_terminal {
+		if matches!(state, TransferState::Running)
+			&& percent % 10 != 0
+			&& percent != 0
+		{
+			return;
+		}
 
-	let stdout = io::stdout();
-	let mut output = stdout.lock();
-	let _ = write!(
-		output,
-		"\r\x1B[2K{operation}: [{bar}] {percent:3}% | {} / {} | {}/s",
-		format_bytes(copied),
-		format_bytes(total_size),
-		format_bytes(bytes_per_second),
+		let status = state.label();
+		let speed = format!("{}/s", format_bytes(bytes_per_second as u64));
+		let time_label = if matches!(state, TransferState::Running) {
+			format!(
+				"ETA {}",
+				format_eta(total_size.saturating_sub(copied), bytes_per_second)
+			)
+		} else {
+			format!("TIME {}", format_duration(elapsed.as_secs()))
+		};
+
+		let _ = writeln!(
+			output,
+			"{operation} {file_name}: {status} | {percent}% | {} / {} | {speed} | {time_label}",
+			format_bytes(copied),
+			format_bytes(total_size),
+		);
+		let _ = output.flush();
+		return;
+	}
+
+	let terminal_columns = terminal_width();
+	// Оставляем одну колонку справа, чтобы курсор не переносился на новую строку.
+	let frame_width = if terminal_columns >= 24 {
+		terminal_columns - 1
+	} else {
+		terminal_columns.max(12)
+	};
+	let content_width = frame_width.saturating_sub(4);
+
+	let mut lines = Vec::with_capacity(DASHBOARD_LINES);
+	lines.push(paint(&dashboard_top_border(frame_width), "90", use_color));
+	lines.push(dashboard_row(
+		&fit_text(&format!("FILE      {file_name}"), content_width),
+		content_width,
+	));
+	lines.push(dashboard_row(
+		&fit_text(&format!("MODE      {operation}"), content_width),
+		content_width,
+	));
+
+	let status = paint(state.label(), state.color(), use_color);
+	let status_text = format!("STATUS    {status}");
+	let status_visible_width =
+		"STATUS    ".chars().count() + state.label().chars().count();
+	lines.push(dashboard_row_styled(
+		&status_text,
+		status_visible_width,
+		content_width,
+	));
+
+	let percent_label = format!("{percent:>3}%");
+	let bar_width =
+		content_width.saturating_sub(percent_label.chars().count() + 1);
+	let filled_width = bar_width * percent / 100;
+	let filled = "█".repeat(filled_width);
+	let empty = "░".repeat(bar_width.saturating_sub(filled_width));
+	let bar_color = match state {
+		TransferState::Running => "36",
+		TransferState::Completed => "32",
+		TransferState::Incomplete | TransferState::Failed => "31",
+	};
+	let bar = format!(
+		"{}{}",
+		paint(&filled, bar_color, use_color),
+		paint(&empty, "90", use_color),
 	);
+	let progress = format!("{bar} {percent_label}");
+	lines.push(dashboard_row_styled(
+		&progress,
+		bar_width + 1 + percent_label.chars().count(),
+		content_width,
+	));
+
+	let size_line = format!(
+		"SIZE      {} / {}",
+		format_bytes(copied),
+		format_bytes(total_size)
+	);
+	lines.push(dashboard_row(
+		&fit_text(&size_line, content_width),
+		content_width,
+	));
+
+	let speed_label = if matches!(state, TransferState::Completed) {
+		"AVG SPEED"
+	} else {
+		"SPEED     "
+	};
+	let speed_line =
+		format!("{speed_label} {}/s", format_bytes(bytes_per_second as u64));
+	lines.push(dashboard_row(
+		&fit_text(&speed_line, content_width),
+		content_width,
+	));
+
+	let time_line = if matches!(state, TransferState::Running) {
+		format!(
+			"ETA       {}",
+			format_eta(total_size.saturating_sub(copied), bytes_per_second)
+		)
+	} else {
+		format!("TIME      {}", format_duration(elapsed.as_secs()))
+	};
+	lines.push(dashboard_row(
+		&fit_text(&time_line, content_width),
+		content_width,
+	));
+	lines.push(paint(
+		&dashboard_bottom_border(frame_width),
+		"90",
+		use_color,
+	));
+
+	if repaint {
+		let _ = write!(output, "\x1B[{DASHBOARD_LINES}A");
+	}
+
+	for line in lines {
+		let _ = write!(output, "\r\x1B[2K{line}\n");
+	}
+
 	let _ = output.flush();
+}
+
+fn dashboard_top_border(width: usize) -> String {
+	let title = " FILE TRANSFER ";
+	let available = width.saturating_sub(2);
+	let title = fit_text(title, available);
+	let remaining = available.saturating_sub(title.chars().count());
+	let left = remaining / 2;
+	let right = remaining - left;
+
+	format!("╭{}{}{}╮", "─".repeat(left), title, "─".repeat(right))
+}
+
+fn dashboard_bottom_border(width: usize) -> String {
+	format!("╰{}╯", "─".repeat(width.saturating_sub(2)))
+}
+
+fn dashboard_row(content: &str, content_width: usize) -> String {
+	dashboard_row_styled(content, content.chars().count(), content_width)
+}
+
+fn dashboard_row_styled(
+	content: &str,
+	visible_width: usize,
+	content_width: usize,
+) -> String {
+	let padding = content_width.saturating_sub(visible_width);
+	format!("│ {content}{} │", " ".repeat(padding))
+}
+
+fn fit_text(value: &str, width: usize) -> String {
+	let chars: Vec<char> = value.chars().collect();
+	if chars.len() <= width {
+		return value.to_owned();
+	}
+
+	if width == 0 {
+		return String::new();
+	}
+	if width == 1 {
+		return "…".to_owned();
+	}
+
+	let mut result: String = chars.into_iter().take(width - 1).collect();
+	result.push('…');
+	result
+}
+
+fn paint(value: &str, color_code: &str, enabled: bool) -> String {
+	if enabled {
+		format!("\x1B[{color_code}m{value}\x1B[0m")
+	} else {
+		value.to_owned()
+	}
+}
+
+fn format_eta(remaining_bytes: u64, bytes_per_second: f64) -> String {
+	if bytes_per_second <= 0.0 || !bytes_per_second.is_finite() {
+		return "--:--:--".to_owned();
+	}
+
+	let seconds = (remaining_bytes as f64 / bytes_per_second).ceil() as u64;
+	format_duration(seconds)
+}
+
+fn format_duration(seconds: u64) -> String {
+	format!(
+		"{:02}:{:02}:{:02}",
+		seconds / 3600,
+		(seconds / 60) % 60,
+		seconds % 60
+	)
 }
 
 /// Форматирует количество байтов в удобный для чтения вид.
@@ -212,8 +580,13 @@ pub fn send_file<W: Write>(
 	// Передаём строго file_size байтов.
 	let mut limited_file = file.take(file_size);
 
-	let sent =
-		copy_with_progress(&mut limited_file, writer, file_size, "Отправка")?;
+	let sent = copy_with_progress(
+		&mut limited_file,
+		writer,
+		file_size,
+		"Отправка",
+		&file_name,
+	)?;
 
 	if sent != file_size {
 		return Err(io::Error::new(
@@ -221,8 +594,6 @@ pub fn send_file<W: Write>(
 			"Исходный файл изменился или закончился во время отправки",
 		));
 	}
-
-	println!("Файл отправлен: {file_name} ({file_size} байт)");
 
 	Ok(())
 }
@@ -355,7 +726,13 @@ fn receive_file<R: Read>(reader: &mut R) -> io::Result<()> {
 	let copy_result = {
 		let mut limited_reader = (&mut *reader).take(file_size);
 
-		copy_with_progress(&mut limited_reader, &mut file, file_size, "Получение")
+		copy_with_progress(
+			&mut limited_reader,
+			&mut file,
+			file_size,
+			"Получение",
+			&file_name,
+		)
 	};
 
 	let received = match copy_result {
@@ -380,11 +757,7 @@ fn receive_file<R: Read>(reader: &mut R) -> io::Result<()> {
 		));
 	}
 
-	println!(
-		"Получен файл: {} ({} байт)",
-		destination.display(),
-		file_size
-	);
+	println!("Файл сохранён: {}", destination.display());
 
 	Ok(())
 }
@@ -467,7 +840,8 @@ mod tests {
 			&mut input,
 			&mut output,
 			input_bytes.len() as u64,
-			"Тест",
+			"Отправка",
+			"test.bin",
 		)
 		.unwrap();
 
@@ -481,7 +855,8 @@ mod tests {
 		let mut output = Vec::new();
 
 		let copied =
-			copy_with_progress(&mut input, &mut output, 0, "Тест").unwrap();
+			copy_with_progress(&mut input, &mut output, 0, "Отправка", "empty.bin")
+				.unwrap();
 
 		assert_eq!(copied, 0);
 		assert!(output.is_empty());
